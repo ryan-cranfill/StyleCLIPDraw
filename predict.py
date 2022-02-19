@@ -480,7 +480,7 @@ def get_image_augmentation(use_normalized_clip):
     ])
     return augment_trans
 
-def initialize_curves(num_paths, canvas_width, canvas_height):
+def initialize_curves(num_paths, canvas_width, canvas_height, black_and_white=True):
     shapes = []
     shape_groups = []
     for i in range(num_paths):
@@ -503,7 +503,12 @@ def initialize_curves(num_paths, canvas_width, canvas_height):
         points[:, 1] *= canvas_height
         path = pydiffvg.Path(num_control_points = num_control_points, points = points, stroke_width = torch.tensor(1.0), is_closed = False)
         shapes.append(path)
-        path_group = pydiffvg.ShapeGroup(shape_ids = torch.tensor([len(shapes) - 1]), fill_color = None, stroke_color = torch.tensor([random.random(), random.random(), random.random(), random.random()]))
+        if black_and_white:
+            path_group = pydiffvg.ShapeGroup(shape_ids=torch.tensor([len(shapes) - 1]), fill_color=None,
+                                             stroke_color=torch.tensor([0., 0., 0., 1.])
+                                             )
+        else:
+            path_group = pydiffvg.ShapeGroup(shape_ids = torch.tensor([len(shapes) - 1]), fill_color = None, stroke_color = torch.tensor([random.random(), random.random(), random.random(), random.random()]))
         shape_groups.append(path_group)
     return shapes, shape_groups
 
@@ -522,12 +527,12 @@ def render_drawing(shapes, shape_groups,\
     return img
 
 
-def style_clip_draw(prompt, style_path,
+def style_clip_draw(prompt, style_path, model, extractor,
                     num_paths=256, num_iter=1000, max_width=50,
                     num_augs=4, style_weight=1.,
                     neg_prompt=None, neg_prompt_2=None,
                     use_normalized_clip=False,
-                    debug=False):
+                    debug=False, st_pbar=None, black_and_white=True, uniform_width=True):
     '''
     Perform StyleCLIPDraw using a given text prompt and style image
     args:
@@ -547,6 +552,7 @@ def style_clip_draw(prompt, style_path,
         np.ndarray(canvas_height, canvas_width, 3)
     '''
     out_path = Path(tempfile.mkdtemp()) / "out.png"
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
     text_input = clip.tokenize(prompt).to(device)
 
@@ -565,7 +571,7 @@ def style_clip_draw(prompt, style_path,
     augment_trans = get_image_augmentation(use_normalized_clip)
 
     # Initialize Random Curves
-    shapes, shape_groups = initialize_curves(num_paths, canvas_width, canvas_height)
+    shapes, shape_groups = initialize_curves(num_paths, canvas_width, canvas_height, black_and_white)
 
     points_vars = []
     stroke_width_vars = []
@@ -577,6 +583,7 @@ def style_clip_draw(prompt, style_path,
         stroke_width_vars.append(path.stroke_width)
     for group in shape_groups:
         group.stroke_color.requires_grad = True
+        # print(group.stroke_color)
         color_vars.append(group.stroke_color)
 
     # Optimizers
@@ -585,7 +592,7 @@ def style_clip_draw(prompt, style_path,
     width_optim = torch.optim.Adam(stroke_width_vars, lr=0.1*lr)
     color_optim = torch.optim.Adam(color_vars, lr=0.01*lr)
 
-    style_pil = PIL.Image.open(str(style_path)).convert("RGB")
+    style_pil = style_path.convert("RGB")
     style_pil = pil_resize_long_edge_to(style_pil, canvas_width)
     style_np = pil_to_np(style_pil)
     style = (np_to_tensor(style_np, "normal").to(device)+1)/2
@@ -611,8 +618,10 @@ def style_clip_draw(prompt, style_path,
                 g['lr'] = 0.1
 
         points_optim.zero_grad()
-        width_optim.zero_grad()
-        color_optim.zero_grad()
+        if not uniform_width:
+            width_optim.zero_grad()
+        if not black_and_white:
+            color_optim.zero_grad()
 
         img = render_drawing(shapes, shape_groups, canvas_width, canvas_height, t, save=(t % 5 == 0))
 
@@ -643,8 +652,10 @@ def style_clip_draw(prompt, style_path,
 
         loss.backward()
         points_optim.step()
-        width_optim.step()
-        color_optim.step()
+        if not uniform_width:
+            width_optim.step()
+        if not black_and_white:
+            color_optim.step()
 
         for path in shapes:
             path.stroke_width.data.clamp_(1.0, max_width)
@@ -659,8 +670,19 @@ def style_clip_draw(prompt, style_path,
                     for j in range(len(shapes[i].points)):
                         shapes_resized[i].points[j] = shapes[i].points[j] * 4
                 img = render_drawing(shapes_resized, shape_groups, canvas_width*4, canvas_height*4, t)
-                yield checkin(img.detach().cpu().numpy()[0], out_path)
+
+                data_obj = {
+                    'shapes': shapes_resized,
+                    'shape_groups': shape_groups,
+                    'width': canvas_width*4,
+                    'height': canvas_height*4,
+                }
+
+                yield checkin(img.detach().cpu().numpy()[0], out_path), data_obj
                 print('Iteration:', t, '\tRender loss:', loss.item())
+
+        if st_pbar is not None:
+            st_pbar.progress(t / num_iter)
 
     with torch.no_grad():
         shapes_resized = copy.deepcopy(shapes)
@@ -670,51 +692,57 @@ def style_clip_draw(prompt, style_path,
                 shapes_resized[i].points[j] = shapes[i].points[j] * 4
         img = render_drawing(shapes_resized, shape_groups, canvas_width*4, canvas_height*4, t).detach().cpu().numpy()[0]
         save_img(img, str(out_path))
-        yield out_path
+        data_obj = {
+            'shapes': shapes_resized,
+            'shape_groups': shape_groups,
+            'width': canvas_width * 4,
+            'height': canvas_height * 4,
+        }
+        yield out_path, data_obj
 
 
-import cog
-
-device, model, preprocess, extractor = None, None, None, None
-
-class Predictor(cog.Predictor):
-    def setup(self):
-        global device, model, preprocess, extractor
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
-        pydiffvg.set_print_timing(False)
-        # Use GPU if available
-        pydiffvg.set_use_gpu(torch.cuda.is_available())
-        pydiffvg.set_device(device)
-
-        # Load the model
-        model, preprocess = clip.load('ViT-B/32', device, jit=False)
-
-        extractor = Vgg16_Extractor(space="normal").to(device)
-
-
-
-    @cog.input("prompt", type=str, default="A person watching TV.",
-               help="Text description of the desired drawing")
-    @cog.input("style_image", type=Path, help="Style Image")
-    @cog.input("num_paths", type=int, default=256, help="Number of drawing strokes.")
-    @cog.input("num_iterations", type=int, default=500, help="Number of optimization iterations")
-    @cog.input("style_strength", type=int, default=50, help="How strong the style should be. 100 (max) is a lot. 0 (min) is no style.")
-    def predict(self, prompt, style_image, num_paths, num_iterations,
-                style_strength=50):
-        """Run a single prediction on the model"""
-        assert isinstance(num_paths, int) and num_paths > 0, 'num_paths should be an positive integer'
-        assert isinstance(num_iterations, int) and num_iterations > 0, 'num_iterations should be an positive integer'
-        # assert num_iterations < 350, 'num_iterations must be less than 350 or else the process will timeout'
-        assert isinstance(style_strength, int) and style_strength >= 0 and style_strength <= 100, \
-                'style_strength should be a positive integer less than 100'
-        assert style_image is not None, 'style_image must be specified'
-        assert prompt is not None and len(prompt) > 0, 'prompt must be specified'
-
-        style_weight = 4 * (style_strength/100)
-
-        for path in style_clip_draw(prompt, str(style_image), num_paths=num_paths,\
-                          num_iter=num_iterations, style_weight=style_weight, num_augs=10):
-            yield path
-
-        return path
+# import cog
+#
+# device, model, preprocess, extractor = None, None, None, None
+#
+# class Predictor(cog.Predictor):
+#     def setup(self):
+#         global device, model, preprocess, extractor
+#         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+#
+#         pydiffvg.set_print_timing(False)
+#         # Use GPU if available
+#         pydiffvg.set_use_gpu(torch.cuda.is_available())
+#         pydiffvg.set_device(device)
+#
+#         # Load the model
+#         model, preprocess = clip.load('ViT-B/32', device, jit=False)
+#
+#         extractor = Vgg16_Extractor(space="normal").to(device)
+#
+#
+#
+#     @cog.input("prompt", type=str, default="A person watching TV.",
+#                help="Text description of the desired drawing")
+#     @cog.input("style_image", type=Path, help="Style Image")
+#     @cog.input("num_paths", type=int, default=256, help="Number of drawing strokes.")
+#     @cog.input("num_iterations", type=int, default=500, help="Number of optimization iterations")
+#     @cog.input("style_strength", type=int, default=50, help="How strong the style should be. 100 (max) is a lot. 0 (min) is no style.")
+#     def predict(self, prompt, style_image, num_paths, num_iterations,
+#                 style_strength=50):
+#         """Run a single prediction on the model"""
+#         assert isinstance(num_paths, int) and num_paths > 0, 'num_paths should be an positive integer'
+#         assert isinstance(num_iterations, int) and num_iterations > 0, 'num_iterations should be an positive integer'
+#         # assert num_iterations < 350, 'num_iterations must be less than 350 or else the process will timeout'
+#         assert isinstance(style_strength, int) and style_strength >= 0 and style_strength <= 100, \
+#                 'style_strength should be a positive integer less than 100'
+#         assert style_image is not None, 'style_image must be specified'
+#         assert prompt is not None and len(prompt) > 0, 'prompt must be specified'
+#
+#         style_weight = 4 * (style_strength/100)
+#
+#         for path in style_clip_draw(prompt, str(style_image), num_paths=num_paths,\
+#                           num_iter=num_iterations, style_weight=style_weight, num_augs=10):
+#             yield path
+#
+#         return path

@@ -41,3 +41,13 @@ Unlike most other image generation models, CLIPDraw produces drawings consisting
 <p align="left">
     <img src="images/style_transfer_results.png" height="600" title="">
 </p>
+
+
+# SETUP - RC NEW
+- make a virtualenv
+- `pip install -r requirements.txt`
+- make sure python3.7-dev is installed
+- `git clone https://github.com/BachiLi/diffvg && cd diffvg && git submodule update --init --recursive && CMAKE_PREFIX_PATH=$(pyenv prefix) DIFFVG_CUDA=1 python setup.py install`
+- `pip install git+https://github.com/openai/CLIP.git --no-deps`
+- i needed to install a diff version of torch for my gpu `pip install -U torch==1.10.2+cu113 torchvision==0.11.3+cu113 torchaudio==0.10.2+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html`
+- roll that beautiful streamlit footage `streamlit run app.py`
