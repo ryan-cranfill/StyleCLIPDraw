@@ -1,4 +1,8 @@
 # StyleCLIPDraw
+## What's new??
+- streamlit app to run instead of notebook 
+
+## ORIGINAL README BELOW!
 #### Peter Schaldenbrand, Zhixuan Liu, Jean Oh September 2021
 
 Featured in the 2021 NeurIPS Workshop on Machine Learning and Design [Presentation](https://slideslive.com/38970834/styleclipdraw-coupling-content-and-style-in-texttodrawing-synthesis?ref=account-folder-92044-folders). 
